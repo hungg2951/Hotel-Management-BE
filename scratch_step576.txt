@@ -1,0 +1,142 @@
+﻿<USER_REQUEST>
+# YÊU CẦU: Triển khai toàn bộ API nghiệp vụ quản trị khách sạn (một người thực hiện, làm tuần tự)
+
+## 0. Cách làm việc
+- Đọc trước: `docs/ARCHITECTURE.md`, các interface trong `<module>.api`, file migration `V1__init_schema.sql`,
+  các Entity/Repository có sẵn. **Không sửa schema.** Thiếu cột hay bảng thì dừng và báo, đừng tự thêm.
+- Chỉ làm **một giai đoạn** mỗi lần tôi yêu cầu (mục 4). Sau mỗi giai đoạn: chạy `mvnw clean verify` xanh,
+  rồi báo cáo ngắn: (a) danh sách endpoint, (b) cách thử bằng Postman, (c) các giả định đã đặt thêm,
+  (d) ba khái niệm Java/Spring chính đã dùng trong giai đoạn đó (tôi đang học Java). Rồi **dừng chờ tôi**.
+- Không đoán tên dependency hay test slice của Spring Boot 4.1: tra tài liệu chính thức trước khi dùng.
+- Chú thích và thông báo lỗi bằng tiếng Việt; tên lớp, biến bằng tiếng Anh.
+
+## 1. Quy ước kiến trúc (bắt buộc)
+1. Tách lớp Controller (nhận request, trả `ApiResponse<T>`) → Service (nghiệp vụ) → Repository. Controller không chứa nghiệp vụ.
+2. **Giữa các module chỉ gọi qua interface trong `<module>.api`** (RoomApi, GuestApi, BookingApi, BillingApi, HousekeepingApi,
+   CurrentUserApi); chỉ truyền `Long` ID và record đơn giản, không import entity/repository/service của module khác.
+   Trong cùng module dùng quan hệ Hibernate (`@ManyToOne`...). Tiền VND là `Long`.
+3. Hướng gọi một chiều: frontdesk → booking, billing, room, guest, housekeeping; booking → room, guest, billing;
+   housekeeping → room. billing, guest, room không gọi module nào khác ngoài `CurrentUserApi`.
+4. Nghiệp vụ ghi nhiều bảng dùng `@Transactional` ở service điều phối. `frontdesk` điều phối check-in, check-out, đổi phòng;
+   các hàm của module khác tham gia cùng transaction (propagation REQUIRED).
+5. Không trả entity ra API. Request/response là record trong gói `dto`.
+6. Mọi API trả `ApiResponse<T>`. Input dùng `@Valid` (message tiếng Việt). Vi phạm nghiệp vụ ném `BusinessException`
+   với mã lỗi ở mục 3; không tự trả `ResponseEntity` lỗi trong controller.
+7. REST: `/api/v1/<tài-nguyên-số-nhiều>`; POST tạo mới trả 201 kèm `Location`; chuyển trạng thái là sub-resource động từ
+   (`POST /reservations/{id}/cancel`); danh sách có phân trang (`page`, `size`, `sort`) và lọc bằng query param;
+   DELETE danh mục là xóa mềm (`is_active = false`).
+8. **Phân quyền:** bật `@EnableMethodSecurity`; vai trò trong DB (`ADMIN`...) ánh xạ thành authority `ROLE_ADMIN`.
+   Dùng `@PreAuthorize("hasAnyRole(...)")` theo ma trận:
+
+| Nhóm API | ADMIN | MANAGER | RECEPTIONIST | ACCOUNTANT | HOUSEKEEPER |
+|---|---|---|---|---|---|
+| Danh mục (room-type, room, rate-plan, room-rate, hotel-service, promotion): ghi | ✔ | ✔ | | | |
+| Danh mục: đọc | ✔ | ✔ | ✔ | ✔ | ✔ |
+| Guest, availability, reservation | ✔ | ✔ | ✔ | | |
+| Check-in, check-out, đổi phòng | ✔ | ✔ | ✔ | | |
+| Folio item, payment, invoice | ✔ | ✔ | ✔ | ✔ | |
+| Xóa folio item, hoàn tiền | ✔ | ✔ | | | |
+| Housekeeping: tạo, phân công | ✔ | ✔ | ✔ | | |
+| Housekeeping: bắt đầu, hoàn thành | ✔ | ✔ | | | ✔ (chỉ task của mình) |
+| Dashboard/báo cáo | ✔ | ✔ | | ✔ | |
+
+   "Task của mình": `users.employee_id` của người đăng nhập (qua `CurrentUserApi`) = `housekeeping_task.assigned_to`.
+9. `created_by`, `received_by`, `posted_by`, `issued_by`... lấy từ `CurrentUserApi`. Thao tác nhạy cảm (hủy đặt phòng,
+   xóa folio item, hoàn tiền, đổi phòng, sửa giá) ghi `audit_log`.
+
+## 2. Quyết định nghiệp vụ đã chốt (không tự đổi, không tự đoán)
+1. **Hai cột trạng thái phòng khác nhau.** `room.status` (AVAILABLE, OCCUPIED, MAINTENANCE, OUT_OF_ORDER) và
+   `room.housekeeping_status` (CLEAN, DIRTY, CLEANING, INSPECTED). DIRTY không phải trạng thái phòng. Task buồng phòng chỉ có
+   PENDING, IN_PROGRESS, DONE (không có COMPLETED). Bộ lọc danh sách phòng gồm hai tham số riêng.
+2. **Khoảng đêm** là nửa mở `[checkIn, checkOut)`, bắt buộc `checkOut > checkIn`.
+3. **Chống trùng phòng:** khi tạo đơn, hệ thống tự gán một phòng tạm cho mỗi `reservation_room` (chọn phòng cùng hạng chưa
+   bị giữ trong các đêm đó, khóa dòng bằng `FOR UPDATE SKIP LOCKED` hoặc tương đương), rồi ghi `room_night` từng đêm.
+   Trùng thì bắt `ORA-00001` → `ROOM_NOT_AVAILABLE`. Lúc check-in lễ tân giữ nguyên hoặc đổi phòng (`releaseRoom` rồi `assignRoom`).
+4. **Ghi tiền vào Folio:** lúc check-in ghi mỗi đêm một dòng `ROOM` (`price_per_night`); nếu đơn có khuyến mãi ghi thêm một dòng
+   `DISCOUNT` với `amount` âm. `folio.total_amount` = tổng `folio_item.amount`, cập nhật lại sau mỗi lần thêm/xóa item
+   trong cùng transaction; khóa dòng folio (`PESSIMISTIC_WRITE`) khi thêm item hoặc thanh toán.
+5. **Số dư** (không có cột `paid_amount`/`balance` trong DB, luôn tính khi đọc): `paid` = tổng `payment` `SUCCESS` trừ tổng
+   `REFUNDED`; `balance = total_amount - paid`. Hoàn tiền là một dòng `payment` mới `status = REFUNDED`.
+   Không cho thanh toán vượt `balance` (`PAYMENT_EXCEEDS_BALANCE`).
+6. **Cọc:** ghi `payment` theo `reservation_id`. Đơn từ `PENDING` sang `CONFIRMED` khi tổng cọc ≥ tiền
+   `booking.min-deposit-nights` đêm đầu (cấu hình, mặc định 1); MANAGER được xác nhận không cần cọc.
+   Lúc check-in gọi `attachDepositsToFolio(reservationId, folioId)` để cọc được tính vào folio.
+7. **Hủy:** miễn phí nếu còn ít nhất `rate_plan.free_cancel_days` ngày trước ngày đến; muộn hơn thì phạt một đêm
+   (dòng `PENALTY`). Hủy: đặt `CANCELLED`, xóa `room_night`, hoàn phần cọc còn lại. Chỉ hủy được khi ở `PENDING` hoặc `CONFIRMED`.
+8. **Walk-in:** trong một transaction: `GuestApi.findOrCreate` → tạo `reservation` (nguồn `WALK_IN`, `CONFIRMED`) và
+   `reservation_room` → gán phòng → check-in như đơn thường (vì `stay` bắt buộc tham chiếu `reservation_room`).
+9. **Gán phòng lúc check-in** chỉ khi `status = AVAILABLE` và `housekeeping_status` thuộc CLEAN hoặc INSPECTED (`ROOM_NOT_READY`).
+10. **Đổi phòng:** phòng mới phải thỏa điều kiện mục 9; giữ nguyên `price_per_night` (trừ khi request nêu gói giá mới);
+    chỉ chuyển các đêm từ hôm nay trở đi. Phòng cũ: `status = AVAILABLE`, `housekeeping_status = DIRTY` và tạo task dọn;
+    phòng mới: `OCCUPIED`.
+11. **VAT:** giá niêm yết đã gồm VAT. `vat_amount = round(total * vat_rate / (100 + vat_rate))`, `subtotal = total - vat_amount`.
+    `vat_rate` đọc từ cấu hình `billing.vat-rate` (mặc định 8); ghi rõ trong README đây là giả định.
+12. **Check-out:** bắt buộc `balance == 0` (`FOLIO_NOT_SETTLED`). Thực hiện: đóng folio, `stay` → `CHECKED_OUT` kèm giờ thực tế,
+    phòng `status = AVAILABLE` + `housekeeping_status = DIRTY`, tự tạo task `CLEANING` (`PENDING`),
+    `reservation_room` và `reservation` → `CHECKED_OUT`.
+13. **Hoàn thành task buồng phòng:** task → `DONE`, `room.housekeeping_status` → `CLEAN`.
+14. **Dashboard:** `occupancyRate = OCCUPIED / (phòng đang hoạt động - MAINTENANCE - OUT_OF_ORDER)`. Doanh thu trả hai số:
+    `collected` (thực thu hôm nay: tổng `SUCCESS` trừ `REFUNDED` có `paid_at` hôm nay) và `recognized`
+    (tổng `folio_item.amount` có `posted_at` hôm nay). Số phòng theo `status` và theo `housekeeping_status` là hai thống kê riêng.
+
+### Máy trạng thái (chỉ cho phép các chuyển sau, còn lại ném `INVALID_STATE`)
+- reservation: PENDING → CONFIRMED → CHECKED_IN → CHECKED_OUT; PENDING/CONFIRMED → CANCELLED; CONFIRMED → NO_SHOW.
+- housekeeping_task: PENDING → IN_PROGRESS → DONE.
+- room.status chỉnh tay: chỉ AVAILABLE ↔ MAINTENANCE/OUT_OF_ORDER; không đặt OCCUPIED bằng tay; không đổi phòng đang OCCUPIED.
+- folio: OPEN → CLOSED; không thêm item hay thanh toán vào folio CLOSED.
+
+## 3. Mã lỗi (dùng đúng tên)
+`NOT_FOUND`(404), `VALIDATION_ERROR`(400), `INVALID_DATE_RANGE`(400), `OVER_CAPACITY`(400), `PROMOTION_INVALID`(400),
+`INVALID_STATE`(409), `ROOM_NOT_AVAILABLE`(409), `ROOM_NOT_READY`(409), `FOLIO_NOT_SETTLED`(409),
+`PAYMENT_EXCEEDS_BALANCE`(409), `DUPLICATE`(409), `FORBIDDEN`(403).
+
+## 4. Sáu giai đoạn (mỗi lần tôi yêu cầu một giai đoạn)
+
+**Giai đoạn 1: Phòng, Giá, Khách (`room`, `guest`)**
+`/room-types`, `/rooms` (lọc `status`, `housekeepingStatus`, `roomTypeId`), `PATCH /rooms/{id}/status`, `/rate-plans`,
+`/room-rates` (không cho hai khoảng ngày chồng nhau cùng hạng, gói, loại ngày), `/promotions`, `/guests` CRUD và
+`GET /guests?idNumber=&phone=&email=`. Triển khai `RoomApi`, `GuestApi`.
+Xong khi: CRUD chạy qua Postman đúng vai trò, máy trạng thái phòng đúng, test xanh.
+
+**Giai đoạn 2: Thu ngân (`billing`)**
+`/hotel-services` CRUD, `GET /folios/{id}` (kèm paid, balance), `POST /folios/{id}/items`, `DELETE /folios/{id}/items/{itemId}`,
+`POST /folios/{id}/payments`, `POST /folios/{id}/invoice`, `GET /invoices/{id}`. Triển khai đầy đủ `BillingApi`.
+Xong khi: thêm item, thanh toán, hoàn tiền cho ra `balance` đúng; không thanh toán vượt số dư; xuất hóa đơn với VAT đúng.
+
+**Giai đoạn 3: Đặt phòng (`booking`)**
+`GET /availability?checkIn=&checkOut=&adults=&children=`, `/reservations` (tạo, xem, lọc),
+`POST /reservations/{id}/deposits`, `/confirm`, `/cancel`, `/no-show`. Triển khai `BookingApi`.
+Xong khi: tính giá nhiều đêm đúng; hủy nhả `room_night`; hai yêu cầu đặt cùng một phòng chỉ một cái thành công.
+
+**Giai đoạn 4: Buồng phòng (`housekeeping`)**
+`/housekeeping-tasks` (tạo, phân công, `start`, `complete`, lọc), `/maintenance-requests`. Triển khai `HousekeepingApi`.
+Xong khi: HOUSEKEEPER chỉ làm được task của mình; hoàn thành task đưa phòng về CLEAN.
+
+**Giai đoạn 5: Lễ tân (`frontdesk`)**
+`POST /check-ins`, `POST /check-ins/walk-in`, `POST /stays/{id}/room-move`, `POST /stays/{id}/check-out`,
+`GET /stays?status=IN_HOUSE`. Điều phối bằng các `api` đã có, trong một `@Transactional`.
+Xong khi: chạy trọn được luồng ở mục 5; lỗi giữa chừng rollback sạch (không để lại stay hay folio dở dang).
+
+**Giai đoạn 6: Báo cáo và hoàn thiện (`report`)**
+`GET /dashboard/rooms-summary`, `/dashboard/occupancy?date=`, `/dashboard/revenue?date=`. Sau đó viết bộ Postman chạy luồng
+mục 5 và cập nhật README (danh sách endpoint, ma trận quyền, quyết định ở mục 2, giả định).
+
+## 5. Luồng nghiệm thu cuối (Postman)
+Đăng nhập lễ tân → tìm phòng trống → tạo khách → đặt phòng 2 đêm → ghi cọc → xác nhận → check-in → thêm dịch vụ →
+thanh toán phần còn lại → check-out (bị chặn nếu còn nợ) → xuất hóa đơn → kiểm tra phòng DIRTY và có task dọn →
+HOUSEKEEPER hoàn thành task → phòng CLEAN → xem dashboard. Thêm hai nhánh: hủy đơn và đổi phòng.
+
+## 6. Kiểm thử (mỗi service)
+- JUnit 5 + Mockito, mỗi nhánh nghiệp vụ chính ít nhất một ca đúng và một ca lỗi.
+- Ca bắt buộc: tính giá nhiều đêm; hủy giải phóng `room_night`; đặt trùng phòng → `ROOM_NOT_AVAILABLE`;
+  check-in cập nhật đúng hai cột trạng thái, mở folio, gắn cọc; check-out bị chặn khi `balance > 0`;
+  đổi phòng chỉ chuyển các đêm từ hôm nay; hoàn thành task đưa phòng về CLEAN; VAT; HOUSEKEEPER không hoàn thành task của người khác.
+- Một test tích hợp trên Oracle thật (schema test riêng) chứng minh hai yêu cầu đặt trùng phòng đồng thời chỉ một cái thành công.
+- Test controller và phân quyền theo tài liệu test của Spring Boot 4.1 (kiểm tra tên starter trước khi viết).
+</USER_REQUEST>
+<ADDITIONAL_METADATA>
+The current local time is: 2026-10-27T11:28:28+07:00.
+</ADDITIONAL_METADATA>
+<USER_SETTINGS_CHANGE>
+The user changed setting `Model Selection` from Gemini 3.8 Flash (Medium) to Gemini 3.8 Flash (High). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.
+</USER_SETTINGS_CHANGE>

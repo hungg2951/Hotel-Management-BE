@@ -1,0 +1,76 @@
+spring:
+  application:
+    name: hotel-management
+  profiles:
+    default: dev
+
+  datasource:
+    url: jdbc:oracle:thin:@${DB_HOST:localhost}:${DB_PORT:1521}/${DB_SERVICE_NAME:FREEPDB1}
+    username: ${DB_USERNAME:hotel_app}
+    password: ${DB_PASSWORD:HotelApp2026#}
+    driver-class-name: oracle.jdbc.OracleDriver
+    hikari:
+      pool-name: HotelHikariPool
+      maximum-pool-size: 10
+      minimum-idle: 2
+      idle-timeout: 30000
+      connection-timeout: 20000
+      max-lifetime: 1800000
+
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+    show-sql: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.OracleDialect
+        format_sql: true
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: false
+    validate-on-migrate: true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: when_authorized
+
+app:
+  jwt:
+    secret: ${JWT_SECRET:hotelManagementSecretKeyMustBeAtLeast256BitsLong2026!}
+    expiration-ms: ${JWT_EXPIRATION_MS:86400000}
+  initial-admin:
+    username: ${INITIAL_ADMIN_USERNAME:admin}
+    password: ${INITIAL_ADMIN_PASSWORD:Admin@Hotel2026!}
+    email: ${INITIAL_ADMIN_EMAIL:admin@demohotel.vn}
+  billing:
+    vat-rate: ${BILLING_VAT_RATE:8.00}
+  booking:
+    min-deposit-nights: ${BOOKING_MIN_DEPOSIT_NIGHTS:1}
+    free-cancel-days: ${BOOKING_FREE_CANCEL_DAYS:3}
+
+---
+spring:
+  config:
+    activate:
+      on-profile: dev
+
+  jpa:
+    show-sql: true
+    properties:
+      hibernate:
+        format_sql: true
+
+logging:
+  level:
+    com.hotel: DEBUG
+    org.hibernate.SQL: DEBUG
+    org.hibernate.orm.jdbc.bind: TRACE
+    org.flywaydb: INFO
